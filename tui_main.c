@@ -458,7 +458,7 @@ staticni void advance_faketab(WINDOW *win, int offset_x, int tabstop) {
 staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
                        char const *filename, Usz field_h, Usz field_w,
                        Usz ruler_spacing_y, Usz ruler_spacing_x, Usz tick_num,
-                       Usz bpm, Ged_cursor const *ged_cursor,
+                       Usz bpm, Usz swing, Ged_cursor const *ged_cursor,
                        Ged_input_mode input_mode, Usz activity_counter) {
   (void)height;
   (void)width;
@@ -471,6 +471,8 @@ staticni void draw_hud(WINDOW *win, int win_y, int win_x, int height, int width,
   wprintw(win, "%zuf", tick_num);
   advance_faketab(win, win_x, Tabstop);
   wprintw(win, "%zu", bpm);
+  advance_faketab(win, win_x, Tabstop);
+  wprintw(win, "%zu", swing);
   advance_faketab(win, win_x, Tabstop);
   print_activity_indicator(win, activity_counter);
   wmove(win, win_y + 1, win_x);
@@ -844,6 +846,44 @@ static bool portmidi_find_name_of_device_id(PmDeviceID id, PmError *out_pmerror,
   osoput(out_name, info->name);
   return true;
 }
+// Input-side equivalents of the two functions above.
+staticni bool portmidi_find_input_device_id_by_name(char const *name,
+                                                    Usz namelen,
+                                                    PmError *out_pmerror,
+                                                    PmDeviceID *out_id) {
+  *out_pmerror = portmidi_init_if_necessary();
+  if (*out_pmerror)
+    return false;
+  int num = Pm_CountDevices();
+  for (int i = 0; i < num; ++i) {
+    PmDeviceInfo const *info = Pm_GetDeviceInfo(i);
+    if (!info || !info->input)
+      continue;
+    Usz len = strlen(info->name);
+    if (len != namelen)
+      continue;
+    if (strncmp(name, info->name, namelen) == 0) {
+      *out_id = i;
+      return true;
+    }
+  }
+  return false;
+}
+static bool portmidi_find_input_name_of_device_id(PmDeviceID id,
+                                                  PmError *out_pmerror,
+                                                  oso **out_name) {
+  *out_pmerror = portmidi_init_if_necessary();
+  if (*out_pmerror)
+    return false;
+  int num = Pm_CountDevices();
+  if (id < 0 || id >= num)
+    return false;
+  PmDeviceInfo const *info = Pm_GetDeviceInfo(id);
+  if (!info || !info->input)
+    return false;
+  osoput(out_name, info->name);
+  return true;
+}
 #endif
 staticni void midi_mode_deinit(Midi_mode *mm) {
   switch (mm->any.type) {
@@ -884,9 +924,13 @@ typedef struct {
   Usz ruler_spacing_y, ruler_spacing_x;
   Ged_input_mode input_mode;
   Usz bpm;
+  Usz swing; // 50-80, 50 = straight
   U64 clock;
   double accum_secs;
   double time_to_next_note_off;
+  bool swing_pending : 1;         // an extra delay for a swung (even) frame is in progress
+  double swing_pending_secs;      // total extra delay for the pending swung frame
+  U64 swing_pending_since;        // stm_now() timestamp the extra delay started counting from
   Oosc_dev *oosc_dev;
   Midi_mode midi_mode;
   Usz activity_counter;
@@ -897,6 +941,20 @@ typedef struct {
   int grid_h;
   int grid_scroll_y, grid_scroll_x; // not sure if i like this being int
   U8 midi_bclock_sixths;            // 0..5, holds 6th of the quarter note step
+#ifdef FEAT_PORTMIDI
+  PortMidiStream *midi_in_stream;
+  PmDeviceID midi_in_device_id;
+  bool midi_in_enabled : 1;
+  bool is_puppet : 1;              // true while frames are being driven by incoming MIDI clock
+  Usz midi_in_pulse_count;         // 0-11, position within the current 8th-note (12-pulse) pair
+  U64 midi_in_last_pulse_time;     // stm_now() timestamp of the last received clock pulse
+  bool midi_in_has_last_pulse : 1;
+  double midi_in_last_interval;    // seconds between the two most recent real pulses
+  Usz midi_in_paused_frame_catchup; // frames elapsed while paused, to catch up on resume
+  bool midi_in_swing_pending : 1;  // a fractional delay for a swung 16th is in progress
+  double midi_in_swing_pending_secs;
+  U64 midi_in_swing_pending_since;
+#endif
   bool needs_remarking : 1;
   bool is_draw_dirty : 1;
   bool is_playing : 1;
@@ -921,9 +979,13 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   a->ruler_spacing_y = a->ruler_spacing_x = 8;
   a->input_mode = Ged_input_mode_normal;
   a->bpm = init_bpm;
+  a->swing = 50;
   a->clock = 0;
   a->accum_secs = 0.0;
   a->time_to_next_note_off = 1.0;
+  a->swing_pending = false;
+  a->swing_pending_secs = 0.0;
+  a->swing_pending_since = 0;
   a->oosc_dev = NULL;
   midi_mode_init_null(&a->midi_mode);
   a->activity_counter = 0;
@@ -934,6 +996,20 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   a->grid_h = 0;
   a->grid_scroll_y = a->grid_scroll_x = 0;
   a->midi_bclock_sixths = 0;
+#ifdef FEAT_PORTMIDI
+  a->midi_in_stream = NULL;
+  a->midi_in_device_id = -1;
+  a->midi_in_enabled = false;
+  a->is_puppet = false;
+  a->midi_in_pulse_count = 0;
+  a->midi_in_last_pulse_time = 0;
+  a->midi_in_has_last_pulse = false;
+  a->midi_in_last_interval = 0.0;
+  a->midi_in_paused_frame_catchup = 0;
+  a->midi_in_swing_pending = false;
+  a->midi_in_swing_pending_secs = 0.0;
+  a->midi_in_swing_pending_since = 0;
+#endif
   a->needs_remarking = true;
   a->is_draw_dirty = false;
   a->is_playing = false;
@@ -943,6 +1019,32 @@ static void ged_init(Ged *a, Usz undo_limit, Usz init_bpm, Usz init_seed) {
   a->is_mouse_dragging = false;
   a->is_hud_visible = false;
 }
+
+#ifdef FEAT_PORTMIDI
+staticni void midi_in_close(Ged *a) {
+  if (a->midi_in_stream) {
+    Pm_Close(a->midi_in_stream);
+    a->midi_in_stream = NULL;
+  }
+  a->midi_in_enabled = false;
+  a->is_puppet = false;
+}
+staticni PmError midi_in_open_portmidi(Ged *a, PmDeviceID dev_id) {
+  midi_in_close(a);
+  PmError e = portmidi_init_if_necessary();
+  if (e)
+    return e;
+  e = Pm_OpenInput(&a->midi_in_stream, dev_id, NULL, 128, NULL, NULL);
+  if (e)
+    return e;
+  a->midi_in_device_id = dev_id;
+  a->midi_in_enabled = true;
+  a->midi_in_has_last_pulse = false;
+  a->midi_in_pulse_count = 0;
+  a->midi_in_paused_frame_catchup = 0;
+  return pmNoError;
+}
+#endif
 
 static void ged_deinit(Ged *a) {
   field_deinit(&a->field);
@@ -956,6 +1058,9 @@ static void ged_deinit(Ged *a) {
   if (a->oosc_dev)
     oosc_dev_destroy(a->oosc_dev);
   midi_mode_deinit(&a->midi_mode);
+#ifdef FEAT_PORTMIDI
+  midi_in_close(a);
+#endif
 }
 
 static bool ged_is_draw_dirty(Ged *a) {
@@ -1239,9 +1344,20 @@ static bool ged_set_osc_udp(Ged *a, char const *dest_addr,
 
 static ORCA_FORCEINLINE double ms_to_sec(double ms) { return ms / 1000.0; }
 
+staticni void ged_set_playing(Ged *a, bool playing); // defined below, used by MIDI-in handling above its definition
+
 static double ged_secs_to_deadline(Ged const *a) {
   if (!a->is_playing)
     return 1.0;
+#ifdef FEAT_PORTMIDI
+  if (a->is_puppet)
+    return 0.005; // stay responsive to incoming MIDI clock rather than computing a musical deadline
+#endif
+  if (a->swing_pending) {
+    double rem =
+        a->swing_pending_secs - stm_sec(stm_diff(stm_now(), a->swing_pending_since));
+    return rem < 0.0 ? 0.0 : rem;
+  }
   double secs_span = 60.0 / (double)a->bpm / 4.0;
   // If MIDI beat clock output is enabled, we need to send an event every 24
   // parts per quarter note. Since we've already divided quarter notes into 4
@@ -1266,14 +1382,58 @@ staticni void clear_and_run_vm(Glyph *restrict gbuf, Mark *restrict mbuf,
   orca_run(gbuf, mbuf, height, width, tick_number, oevent_list, random_seed);
 }
 
+// Actually steps the VM forward by one frame and sends any resulting output
+// events. Shared by the straight (master) path below and, later, by direct
+// MIDI-clock-in triggering, which never goes through the busy-wait loop at
+// all.
+staticni void ged_step_vm(Ged *a, Oosc_dev *oosc_dev, Midi_mode *midi_mode,
+                          double elapsed_secs) {
+  apply_time_to_sustained_notes(oosc_dev, midi_mode, elapsed_secs,
+                                &a->susnote_list, &a->time_to_next_note_off);
+  clear_and_run_vm(a->field.buffer, a->mbuf_r.buffer, a->field.height,
+                   a->field.width, a->tick_num, &a->oevent_list,
+                   a->random_seed);
+  ++a->tick_num;
+  a->needs_remarking = true;
+  a->is_draw_dirty = true;
+
+  Usz count = a->oevent_list.count;
+  if (count > 0) {
+    send_output_events(oosc_dev, midi_mode, a->bpm, &a->susnote_list,
+                       a->oevent_list.buffer, count);
+    a->activity_counter += count;
+  }
+}
+
 staticni void ged_do_stuff(Ged *a) {
   if (!a->is_playing)
     return;
+#ifdef FEAT_PORTMIDI
+  // While puppeteered, frames are driven directly from ged_process_midi_in()
+  // instead of this busy-wait loop - see that function.
+  if (a->is_puppet)
+    return;
+#endif
+  Oosc_dev *oosc_dev = a->oosc_dev;
+  Midi_mode *midi_mode = &a->midi_mode;
+
+  // A swung (even) frame's extra delay, layered on top of an already-elapsed
+  // straight tick below, is in progress: just check whether it's elapsed yet.
+  // The underlying straight tick has already advanced independently (below)
+  // and must not be re-measured here.
+  if (a->swing_pending) {
+    if (stm_sec(stm_diff(stm_now(), a->swing_pending_since)) <
+        a->swing_pending_secs)
+      return;
+    a->swing_pending = false;
+    ged_step_vm(a, oosc_dev, midi_mode,
+               60.0 / (double)a->bpm / 4.0 + a->swing_pending_secs);
+    return;
+  }
+
   double secs_span = 60.0 / (double)a->bpm / 4.0;
   if (a->midi_bclock) // see also ged_secs_to_deadline()
     secs_span /= 6.0;
-  Oosc_dev *oosc_dev = a->oosc_dev;
-  Midi_mode *midi_mode = &a->midi_mode;
   bool crossed_deadline = false;
 #if TIME_DEBUG
   Usz spins = 0;
@@ -1313,28 +1473,164 @@ staticni void ged_do_stuff(Ged *a) {
   if (!crossed_deadline)
     return;
   if (a->midi_bclock) {
-    send_midi_byte(oosc_dev, midi_mode, 0xF8); // MIDI beat clock
+    send_midi_byte(oosc_dev, midi_mode, 0xF8); // MIDI beat clock - always straight, independent of swing
     Usz sixths = a->midi_bclock_sixths;
     a->midi_bclock_sixths = (U8)((sixths + 1) % 6);
     if (sixths != 0)
       return;
   }
-  apply_time_to_sustained_notes(oosc_dev, midi_mode, secs_span,
-                                &a->susnote_list, &a->time_to_next_note_off);
-  clear_and_run_vm(a->field.buffer, a->mbuf_r.buffer, a->field.height,
-                   a->field.width, a->tick_num, &a->oevent_list,
-                   a->random_seed);
-  ++a->tick_num;
-  a->needs_remarking = true;
-  a->is_draw_dirty = true;
 
-  Usz count = a->oevent_list.count;
-  if (count > 0) {
-    send_output_events(oosc_dev, midi_mode, a->bpm, &a->susnote_list,
-                       a->oevent_list.buffer, count);
-    a->activity_counter += count;
+  // Odd tick numbers are anchors and fire immediately, exactly on this
+  // already-elapsed straight tick. Even tick numbers are swung: defer the
+  // actual VM step by an extra delay layered on top, rather than firing here.
+  bool upcoming_is_swung = (a->tick_num % 2) == 0;
+  if (upcoming_is_swung && a->swing != 50) {
+    double straight_span = 60.0 / (double)a->bpm / 4.0;
+    double ratio = (double)a->swing / 100.0;
+    double extra = straight_span * (2.0 * ratio - 1.0);
+    if (extra > 0.0) {
+      a->swing_pending = true;
+      a->swing_pending_since = stm_now();
+      a->swing_pending_secs = extra;
+      return;
+    }
+  }
+  ged_step_vm(a, oosc_dev, midi_mode, secs_span);
+}
+
+#ifdef FEAT_PORTMIDI
+// Continuous position, in pulses, of the swung (off-beat) frame within the
+// 12-pulse 8th-note pair (24ppqn MIDI clock = 12 pulses per 8th note).
+// Mirrors ged_do_stuff's swing math, expressed in pulse units instead of
+// seconds, since real incoming pulses are what we anchor against here
+// instead of a free-running interval.
+staticni double ged_swing_pulse_position(Ged const *a) {
+  return ((double)a->swing / 100.0) * 12.0;
+}
+
+staticni void ged_midi_in_step_vm(Ged *a) {
+  if (a->midi_in_paused_frame_catchup > 0) {
+    a->tick_num += a->midi_in_paused_frame_catchup;
+    a->midi_in_paused_frame_catchup = 0;
+  }
+  double elapsed = a->midi_in_has_last_pulse
+                       ? a->midi_in_last_interval * 6.0
+                       : 60.0 / (double)a->bpm / 4.0;
+  ged_step_vm(a, a->oosc_dev, &a->midi_mode, elapsed);
+}
+
+staticni void ged_untap(Ged *a) {
+  a->is_puppet = false;
+  a->midi_in_has_last_pulse = false;
+  a->midi_in_pulse_count = 0;
+  a->midi_in_swing_pending = false;
+  if (a->is_playing) {
+    // Resume our own bpm-driven clock cleanly from this moment, rather than
+    // measuring against whenever it last ticked before puppeteering began.
+    a->clock = stm_now();
+    a->accum_secs = 0.0;
   }
 }
+
+// Direct translation of clock.js's tap(): fires immediately on real pulses,
+// with no scheduler, no averaging, no round trip - anchor (8th note, every
+// 12th pulse) or swung (16th note, nearest pulse to the swing ratio, plus a
+// small bounded fractional wait) - anything else is a pulse we don't act on.
+staticni void ged_midi_clock_tap(Ged *a) {
+  U64 now = stm_now();
+  if (a->midi_in_has_last_pulse) {
+    double delta = stm_sec(stm_diff(now, a->midi_in_last_pulse_time));
+    if (delta > 0.0 && delta < 1.0) // ignore absurd gaps (e.g. after a long pause)
+      a->midi_in_last_interval = delta;
+  }
+  a->midi_in_last_pulse_time = now;
+  a->midi_in_has_last_pulse = true;
+  a->midi_in_pulse_count = (a->midi_in_pulse_count + 1) % 12;
+  a->is_puppet = true;
+
+  bool is_anchor = a->midi_in_pulse_count == 0;
+  double target = ged_swing_pulse_position(a);
+  Usz floor_pulse = (Usz)target;
+  if (!is_anchor && a->midi_in_pulse_count != floor_pulse)
+    return;
+
+  if (!a->is_playing) {
+    ++a->midi_in_paused_frame_catchup;
+    return;
+  }
+
+  if (is_anchor) {
+    ged_midi_in_step_vm(a);
+    return;
+  }
+
+  double fraction = target - (double)floor_pulse;
+  if (fraction <= 0.0) {
+    ged_midi_in_step_vm(a);
+    return;
+  }
+  // Wait out only the small fractional remainder, using the most recently
+  // measured real pulse interval - bounded, self-correcting extrapolation,
+  // re-grounded by the next real pulse regardless.
+  double interval = a->midi_in_has_last_pulse
+                        ? a->midi_in_last_interval
+                        : (60.0 / (double)a->bpm / 4.0) / 6.0;
+  a->midi_in_swing_pending = true;
+  a->midi_in_swing_pending_since = now;
+  a->midi_in_swing_pending_secs = fraction * interval;
+}
+
+// Drains queued incoming MIDI events and resolves any pending fractional
+// swing wait. Call this unconditionally, once per main loop iteration,
+// whenever a->midi_in_stream is open - MIDI clock is time-critical and
+// shouldn't wait on the keyboard-input branch.
+staticni void ged_process_midi_in(Ged *a) {
+  if (!a->midi_in_stream)
+    return;
+  for (;;) {
+    PmEvent events[64];
+    int n = Pm_Read(a->midi_in_stream, events, 64);
+    if (n <= 0)
+      break;
+    for (int i = 0; i < n; ++i) {
+      switch (Pm_MessageStatus(events[i].message)) {
+      case 0xF8: // Clock
+        ged_midi_clock_tap(a);
+        break;
+      case 0xFA: // Start
+        a->tick_num = 0;
+        a->midi_in_pulse_count = 0;
+        a->midi_in_paused_frame_catchup = 0;
+        a->is_puppet = true;
+        ged_set_playing(a, true);
+        break;
+      case 0xFB: // Continue
+        a->is_puppet = true;
+        ged_set_playing(a, true);
+        break;
+      case 0xFC: // Stop
+        ged_set_playing(a, false);
+        break;
+      default:
+        break;
+      }
+    }
+    if (n < 64)
+      break;
+  }
+  if (a->midi_in_swing_pending) {
+    if (stm_sec(stm_diff(stm_now(), a->midi_in_swing_pending_since)) >=
+        a->midi_in_swing_pending_secs) {
+      a->midi_in_swing_pending = false;
+      ged_midi_in_step_vm(a);
+    }
+  }
+  if (a->is_puppet && a->midi_in_has_last_pulse &&
+      stm_sec(stm_diff(stm_now(), a->midi_in_last_pulse_time)) > 2.0) {
+    ged_untap(a);
+  }
+}
+#endif
 
 static inline Isz isz_clamp(Isz x, Isz low, Isz high) {
   return x < low ? low : x > high ? high : x;
@@ -1446,7 +1742,7 @@ staticni void ged_draw(Ged *a, WINDOW *win, char const *filename,
     int hud_x = win_w > 50 + a->softmargin_x * 2 ? a->softmargin_x : 0;
     draw_hud(win, a->grid_h, hud_x, Hud_height, win_w, filename,
              a->field.height, a->field.width, a->ruler_spacing_y,
-             a->ruler_spacing_x, a->tick_num, a->bpm, &a->ged_cursor,
+             a->ruler_spacing_x, a->tick_num, a->bpm, a->swing, &a->ged_cursor,
              a->input_mode, a->activity_counter);
   }
   if (a->draw_event_list)
@@ -1470,6 +1766,18 @@ staticni void ged_adjust_bpm(Ged *a, Isz delta_bpm) {
     a->bpm = (Usz)new_bpm;
     a->is_draw_dirty = true;
     ged_send_osc_bpm(a, (I32)new_bpm);
+  }
+}
+
+staticni void ged_adjust_swing(Ged *a, Isz delta_swing) {
+  Isz new_swing = (Isz)a->swing + delta_swing;
+  if (new_swing < 50)
+    new_swing = 50;
+  else if (new_swing > 80)
+    new_swing = 80;
+  if ((Usz)new_swing != a->swing) {
+    a->swing = (Usz)new_swing;
+    a->is_draw_dirty = true;
   }
 }
 
@@ -1984,6 +2292,7 @@ enum {
   Set_fancy_grid_rulers_menu_id,
 #ifdef FEAT_PORTMIDI
   Portmidi_output_device_menu_id,
+  Portmidi_input_device_menu_id,
 #endif
 };
 enum {
@@ -2011,6 +2320,7 @@ enum {
   Main_menu_osc,
 #ifdef FEAT_PORTMIDI
   Main_menu_choose_portmidi_output,
+  Main_menu_choose_portmidi_input,
 #endif
 };
 
@@ -2029,6 +2339,7 @@ static void push_main_menu(void) {
   qmenu_add_choice(qm, Main_menu_osc, "OSC Output...");
 #ifdef FEAT_PORTMIDI
   qmenu_add_choice(qm, Main_menu_choose_portmidi_output, "MIDI Output...");
+  qmenu_add_choice(qm, Main_menu_choose_portmidi_input, "MIDI Input...");
 #endif
   qmenu_add_spacer(qm);
   qmenu_add_choice(qm, Main_menu_playback, "Clock & Timing...");
@@ -2360,6 +2671,46 @@ staticni void push_portmidi_output_device_menu(Midi_mode const *midi_mode) {
     qmenu_destroy(qm);
     qmsg_printf_push("No PortMidi Devices",
                      "No PortMidi output devices found.");
+    return;
+  }
+  if (has_cur_dev_id) {
+    qmenu_set_current_item(qm, cur_dev_id);
+  }
+  qmenu_push_to_nav(qm);
+}
+
+staticni void push_portmidi_input_device_menu(Ged const *ged) {
+  Qmenu *qm = qmenu_create(Portmidi_input_device_menu_id);
+  qmenu_set_title(qm, "PortMidi Input Device Selection");
+  PmError e = portmidi_init_if_necessary();
+  if (e) {
+    qmenu_destroy(qm);
+    qmsg_printf_push("PortMidi Error",
+                     "PortMidi error during initialization:\n%s",
+                     Pm_GetErrorText(e));
+    return;
+  }
+  int num = Pm_CountDevices();
+  int input_devices = 0;
+  int cur_dev_id = 0;
+  bool has_cur_dev_id = false;
+  if (ged->midi_in_enabled) {
+    cur_dev_id = ged->midi_in_device_id;
+    has_cur_dev_id = true;
+  }
+  for (int i = 0; i < num; ++i) {
+    PmDeviceInfo const *info = Pm_GetDeviceInfo(i);
+    if (!info || !info->input)
+      continue;
+    bool is_cur_dev_id = has_cur_dev_id && cur_dev_id == i;
+    qmenu_add_printf(qm, i, "(%c) #%d - %s", is_cur_dev_id ? '*' : ' ', i,
+                     info->name);
+    ++input_devices;
+  }
+  if (input_devices == 0) {
+    qmenu_destroy(qm);
+    qmsg_printf_push("No PortMidi Devices",
+                     "No PortMidi input devices found.");
     return;
   }
   if (has_cur_dev_id) {
@@ -2933,6 +3284,9 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
         case Main_menu_choose_portmidi_output:
           push_portmidi_output_device_menu(&t->ged.midi_mode);
           break;
+        case Main_menu_choose_portmidi_input:
+          push_portmidi_input_device_menu(&t->ged);
+          break;
 #endif
         }
         break;
@@ -3068,6 +3422,18 @@ staticni Tui_menus_result tui_drive_menus(Tui *t, int key) {
         if (pme) {
           qmsg_printf_push("PortMidi Error",
                            "Error setting PortMidi output device:\n%s",
+                           Pm_GetErrorText(pme));
+        } else {
+          tui_save_prefs(t);
+        }
+        break;
+      }
+      case Portmidi_input_device_menu_id: {
+        PmError pme = midi_in_open_portmidi(&t->ged, act.picked.id);
+        qnav_stack_pop();
+        if (pme) {
+          qmsg_printf_push("PortMidi Error",
+                           "Error setting PortMidi input device:\n%s",
                            Pm_GetErrorText(pme));
         } else {
           tui_save_prefs(t);
@@ -3455,6 +3821,11 @@ event_loop:;
     wtimeout(stdscr, 0); // Until we run out, don't wait between events.
     cur_timeout = 0;
   }
+#ifdef FEAT_PORTMIDI
+  // MIDI clock is time-critical and shouldn't wait on the ERR/no-key branch
+  // below, so poll it unconditionally, every iteration.
+  ged_process_midi_in(&t.ged);
+#endif
   switch (key) {
   case ERR: { // ERR indicates no more events.
     ged_do_stuff(&t.ged);
@@ -3680,6 +4051,12 @@ event_loop:;
     break;
   case '>':
     ged_adjust_bpm(&t.ged, 1);
+    break;
+  case CTRL_PLUS('<'):
+    ged_adjust_swing(&t.ged, -1);
+    break;
+  case CTRL_PLUS('>'):
+    ged_adjust_swing(&t.ged, 1);
     break;
   case CTRL_PLUS('f'):
     ged_input_cmd(&t.ged, Ged_input_cmd_step_forward);
